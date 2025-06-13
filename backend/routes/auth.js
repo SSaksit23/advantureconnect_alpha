@@ -4,12 +4,15 @@ const jwt = require('jsonwebtoken');
 const Joi = require('joi');
 const pool = require('../models/database');
 const { authenticateToken } = require('../middleware/auth');
+const env = require('../config/env'); // Centralised, validated environment variables
+const { addToBlacklist } = require('../services/redisService'); // Token blacklist helper
+const { sendNewCsrfToken } = require('../middleware/csrf'); // CSRF token helper
 
 const router = express.Router();
 
-// Environment variables with defaults
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback_jwt_secret_change_in_production';
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
+// Secure environment variables (validated at startup – no insecure fallbacks)
+const JWT_SECRET = env.JWT_SECRET;
+const JWT_EXPIRES_IN = env.jwtExpiresIn;
 
 // Validation schemas
 const registerSchema = Joi.object({
@@ -296,12 +299,64 @@ router.post('/refresh', async (req, res) => {
 });
 
 // Logout (client-side token removal, but we can blacklist tokens here if needed)
-router.post('/logout', authenticateToken, (req, res) => {
-  // In a more advanced setup, you'd add the token to a blacklist
-  res.json({
-    success: true,
-    message: 'Logout successful. Please remove token from client storage.'
-  });
+router.post('/logout', authenticateToken, async (req, res) => {
+  /**
+   * Extract the raw JWT from the Authorization header so we can
+   * invalidate it server-side by pushing it into the Redis blacklist.
+   */
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    // This should never happen because authenticateToken already checked it,
+    // but handle defensively.
+    return res.status(400).json({
+      success: false,
+      message: 'Unable to process logout: token missing.'
+    });
+  }
+
+  try {
+    const blacklisted = await addToBlacklist(token);
+
+    return res.json({
+      success: true,
+      message: blacklisted
+        ? 'Logout successful. Token has been revoked.'
+        : 'Logout successful. (Token revocation skipped – Redis unavailable)',
+    });
+  } catch (err) {
+    // Fail-open: still let the client know logout succeeded, but log the error.
+    console.error('Error blacklisting token during logout:', err);
+    return res.json({
+      success: true,
+      message: 'Logout successful, but token could not be revoked server-side.',
+    });
+  }
+});
+
+/**
+ * ---------------------------------------------------------------------------
+ * GET /api/auth/csrf-token
+ * ---------------------------------------------------------------------------
+ * Returns a fresh CSRF token for authenticated users.
+ *
+ * Workflow:
+ *   1. `authenticateToken` verifies JWT and populates `req.user`.
+ *   2. `sendNewCsrfToken` generates a new CSRF token, stores it in Redis,
+ *      sets a cookie (`_csrfToken`), and responds with JSON:
+ *        { success: true, csrfToken: "<token>" }
+ *
+ * Frontend Usage:
+ *   - Call this endpoint immediately after login (or page refresh) to obtain
+ *     a valid CSRF token.
+ *   - Include the token in the `X-CSRF-Token` header for all subsequent
+ *     POST / PUT / DELETE / PATCH requests.
+ */
+router.get('/csrf-token', authenticateToken, (req, res) => {
+  // Handler wrapper since `sendNewCsrfToken` can act as a standalone endpoint
+  // when called with (req, res) only.
+  sendNewCsrfToken(req, res);
 });
 
 module.exports = router;

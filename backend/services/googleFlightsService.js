@@ -1,79 +1,85 @@
-/**
- * Google Flights API Service
- * Integrates with RapidAPI Google Flights2 API for flight search functionality
- */
-
+// backend/services/googleFlightsService.js
 const axios = require('axios');
 const winston = require('winston');
+const env = require('../config/env');
+const cacheService = require('./cacheService'); // Import the CacheService
+const { AppError } = require('../utils/responseHandler'); // For structured errors
 
-// Configure logger
+// Configure logger for this service
 const logger = winston.createLogger({
-  level: 'info',
+  level: env.getEnv('LOG_LEVEL', 'info'),
   format: winston.format.combine(
-    winston.format.timestamp(),
+    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    winston.format.errors({ stack: true }),
+    winston.format.splat(),
     winston.format.json()
   ),
   defaultMeta: { service: 'google-flights-service' },
   transports: [
     new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple()
-      )
-    })
-  ]
+      format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
+    }),
+    // Add file transports if needed for production logs
+  ],
 });
+
+// Hypothetical Google Flights Data API endpoint
+// In reality, Google Flights does not offer a public search API like this.
+// This is a placeholder for what such an API *might* look like.
+const GOOGLE_FLIGHTS_API_BASE_URL = env.getEnv('GOOGLE_FLIGHTS_API_BASE_URL', 'https://flights.googleapis.com/v3'); // Example
+
+const CACHE_TYPE_GOOGLE_FLIGHTS = 'google_flights';
+const DEFAULT_CACHE_TTL_GOOGLE_FLIGHTS = env.getEnv('CACHE_GOOGLE_FLIGHTS_TTL_SECONDS', 10 * 60, 'number'); // 10 minutes
 
 class GoogleFlightsService {
   constructor() {
-    this.baseURL = 'https://google-flights2.p.rapidapi.com';
-    this.apiKey = process.env.RAPIDAPI_KEY;
-    this.apiHost = 'google-flights2.p.rapidapi.com';
-    
+    this.apiKey = env.getEnv('GOOGLE_FLIGHTS_API_KEY'); // This would be your API key for the hypothetical service
+    this.baseURL = GOOGLE_FLIGHTS_API_BASE_URL;
+
     if (!this.apiKey) {
-      logger.warn('RAPIDAPI_KEY not found in environment variables');
+      logger.warn(
+        'GOOGLE_FLIGHTS_API_KEY is not set. GoogleFlightsService will not be able to make live requests and might rely on fallbacks or fail.'
+      );
     }
 
-    // Configure axios instance
     this.client = axios.create({
       baseURL: this.baseURL,
-      timeout: 30000,
+      timeout: env.getEnv('GOOGLE_FLIGHTS_API_TIMEOUT_MS', 30000, 'number'), // 30 seconds timeout
       headers: {
-        'X-RapidAPI-Key': this.apiKey,
-        'X-RapidAPI-Host': this.apiHost,
-        'Content-Type': 'application/json'
-      }
+        'Content-Type': 'application/json',
+      },
     });
 
-    // Add request/response interceptors for logging
+    // Axios interceptors for logging and potentially adding API key/auth
     this.client.interceptors.request.use(
       (config) => {
-        logger.info('Google Flights API Request', {
-          method: config.method,
-          url: config.url,
-          params: config.params
-        });
+        // Add API key as a query parameter (common for Google APIs if not using OAuth)
+        if (this.apiKey) {
+          config.params = { ...config.params, key: this.apiKey };
+        }
+        logger.info(`GoogleFlightsAPI Request: ${config.method.toUpperCase()} ${config.url}`, { params: config.params, data: config.data });
         return config;
       },
       (error) => {
-        logger.error('Google Flights API Request Error', error);
+        logger.error('GoogleFlightsAPI Request Interceptor Error', { error: error.message });
         return Promise.reject(error);
       }
     );
 
     this.client.interceptors.response.use(
       (response) => {
-        logger.info('Google Flights API Response', {
-          status: response.status,
-          url: response.config.url
-        });
+        logger.info(`GoogleFlightsAPI Response: ${response.status} ${response.config.url}`);
         return response;
       },
       (error) => {
-        logger.error('Google Flights API Response Error', {
-          status: error.response?.status,
+        // Log the full error structure for better debugging
+        logger.error('GoogleFlightsAPI Response Interceptor Error', {
           message: error.message,
-          url: error.config?.url
+          status: error.response?.status,
+          url: error.config?.url,
+          responseData: error.response?.data,
+          requestData: error.config?.data,
+          requestParams: error.config?.params,
         });
         return Promise.reject(error);
       }
@@ -81,287 +87,288 @@ class GoogleFlightsService {
   }
 
   /**
-   * Search for flights between two destinations
-   * @param {Object} searchParams - Flight search parameters
-   * @returns {Promise<Object>} - Flight search results
+   * Formats the application's search parameters into a hypothetical Google Flights API request body.
+   * This is highly speculative as no public Google Flights search API exists.
+   * @param {object} searchParams - User's search parameters.
+   *   Expected: origin (IATA), destination (IATA), departureDate (YYYY-MM-DD),
+   *             [returnDate (YYYY-MM-DD)], [adults=1], [children=0], [infantsInLap=0],
+   *             [cabin='ECONOMY'], [currency='USD'], [maxResults=10]
+   * @returns {object} Google Flights API compatible request body.
    */
-  async searchFlights(searchParams) {
-    try {
-      const {
-        origin,
-        destination,
-        departureDate,
-        returnDate,
-        adults = 1,
-        children = 0,
-        infants = 0,
-        cabinClass = 'ECONOMY',
-        maxPrice,
-        currency = 'USD'
-      } = searchParams;
-
-      // Validate required parameters
-      if (!origin || !destination || !departureDate) {
-        throw new Error('Missing required parameters: origin, destination, or departureDate');
-      }
-
-      // Prepare request parameters for Google Flights API
-      const requestParams = {
-        engine: 'google_flights',
-        departure_id: origin,
-        arrival_id: destination,
-        outbound_date: departureDate,
-        return_date: returnDate,
-        adults: adults,
-        children: children,
-        infants_in_seat: infants,
-        currency: currency,
-        hl: 'en'
-      };
-
-      // Add optional parameters
-      if (maxPrice) {
-        requestParams.max_price = maxPrice;
-      }
-
-      if (cabinClass && cabinClass !== 'ECONOMY') {
-        requestParams.travel_class = cabinClass.toLowerCase();
-      }
-
-      logger.info('Searching flights with parameters', requestParams);
-
-      const response = await this.client.get('/search', {
-        params: requestParams
-      });
-
-      return this.formatFlightResults(response.data, searchParams);
-
-    } catch (error) {
-      logger.error('Flight search error', {
-        error: error.message,
-        searchParams
-      });
-      
-      if (error.response?.status === 401) {
-        throw new Error('Invalid API key. Please check your RapidAPI credentials.');
-      } else if (error.response?.status === 429) {
-        throw new Error('API rate limit exceeded. Please try again later.');
-      } else if (error.response?.status === 400) {
-        throw new Error('Invalid search parameters. Please check your input.');
-      }
-      
-      throw new Error(`Flight search failed: ${error.message}`);
-    }
-  }
-
-  /**
-   * Get flight details by ID
-   * @param {string} flightId - Flight identifier
-   * @returns {Promise<Object>} - Flight details
-   */
-  async getFlightDetails(flightId) {
-    try {
-      logger.info('Getting flight details', { flightId });
-
-      const response = await this.client.get(`/flight/${flightId}`);
-      
-      return this.formatFlightDetails(response.data);
-
-    } catch (error) {
-      logger.error('Get flight details error', {
-        error: error.message,
-        flightId
-      });
-      
-      throw new Error(`Failed to get flight details: ${error.message}`);
-    }
-  }
-
-  /**
-   * Get popular destinations from an origin
-   * @param {string} origin - Origin airport code
-   * @returns {Promise<Array>} - Popular destinations
-   */
-  async getPopularDestinations(origin) {
-    try {
-      logger.info('Getting popular destinations', { origin });
-
-      const response = await this.client.get('/destinations', {
-        params: {
-          departure_id: origin,
-          currency: 'USD'
-        }
-      });
-
-      return this.formatDestinations(response.data);
-
-    } catch (error) {
-      logger.error('Get popular destinations error', {
-        error: error.message,
-        origin
-      });
-      
-      throw new Error(`Failed to get popular destinations: ${error.message}`);
-    }
-  }
-
-  /**
-   * Format flight search results to standardized format
-   * @param {Object} rawData - Raw API response
-   * @param {Object} searchParams - Original search parameters
-   * @returns {Object} - Formatted flight results
-   */
-  formatFlightResults(rawData, searchParams) {
-    try {
-      const flights = rawData.best_flights || rawData.other_flights || [];
-      
-      const formattedFlights = flights.map(flight => ({
-        id: flight.flight_id || `${flight.flights?.[0]?.flight_number}_${Date.now()}`,
-        airline: {
-          code: flight.flights?.[0]?.airline,
-          name: flight.flights?.[0]?.airline_logo ? 
-                flight.flights[0].airline_logo.split('/').pop().replace('.png', '') : 
-                flight.flights?.[0]?.airline
-        },
-        price: {
-          total: flight.price,
-          currency: searchParams.currency || 'USD',
-          pricePerAdult: Math.round(flight.price / (searchParams.adults || 1))
-        },
-        duration: {
-          total: flight.total_duration,
-          outbound: flight.flights?.[0]?.duration,
-          return: flight.flights?.[1]?.duration
-        },
-        segments: this.formatSegments(flight.flights || []),
-        stops: flight.layovers?.length || 0,
-        layovers: flight.layovers || [],
-        bookingOptions: flight.booking_options || [],
-        carbonEmissions: flight.carbon_emissions,
-        departure: {
-          airport: searchParams.origin,
-          time: flight.flights?.[0]?.departure_airport?.time,
-          date: searchParams.departureDate
-        },
-        arrival: {
-          airport: searchParams.destination,
-          time: flight.flights?.[0]?.arrival_airport?.time,
-          date: searchParams.departureDate
-        }
-      }));
-
-      return {
-        success: true,
-        searchParams,
-        results: {
-          flights: formattedFlights,
-          totalResults: formattedFlights.length,
-          searchId: rawData.search_id,
-          searchMetadata: rawData.search_metadata
-        },
-        meta: {
-          currency: searchParams.currency || 'USD',
-          searchTime: new Date().toISOString(),
-          provider: 'Google Flights'
-        }
-      };
-
-    } catch (error) {
-      logger.error('Error formatting flight results', error);
-      throw new Error('Failed to format flight results');
-    }
-  }
-
-  /**
-   * Format flight segments
-   * @param {Array} flights - Raw flight segments
-   * @returns {Array} - Formatted segments
-   */
-  formatSegments(flights) {
-    return flights.map(flight => ({
-      departure: {
-        airport: flight.departure_airport?.id,
-        name: flight.departure_airport?.name,
-        time: flight.departure_airport?.time,
-        terminal: flight.departure_airport?.terminal
+  _formatRequest(searchParams) {
+    const slices = [
+      {
+        origin: searchParams.origin,
+        destination: searchParams.destination,
+        date: searchParams.departureDate,
       },
-      arrival: {
-        airport: flight.arrival_airport?.id,
-        name: flight.arrival_airport?.name,
-        time: flight.arrival_airport?.time,
-        terminal: flight.arrival_airport?.terminal
-      },
-      airline: {
-        code: flight.airline,
-        name: flight.airline_logo ? 
-              flight.airline_logo.split('/').pop().replace('.png', '') : 
-              flight.airline
-      },
-      flightNumber: flight.flight_number,
-      aircraft: flight.airplane,
-      duration: flight.duration,
-      cabinClass: flight.travel_class
-    }));
-  }
+    ];
 
-  /**
-   * Format flight details
-   * @param {Object} rawData - Raw flight details
-   * @returns {Object} - Formatted flight details
-   */
-  formatFlightDetails(rawData) {
+    if (searchParams.returnDate) {
+      slices.push({
+        origin: searchParams.destination,
+        destination: searchParams.origin,
+        date: searchParams.returnDate,
+      });
+    }
+    
+    const cabinMap = { // Map our cabin types to hypothetical Google cabin types
+        ECONOMY: 'COACH',
+        PREMIUM_ECONOMY: 'PREMIUM_COACH',
+        BUSINESS: 'BUSINESS',
+        FIRST: 'FIRST'
+    };
+    const googleCabin = searchParams.cabin ? (cabinMap[searchParams.cabin.toUpperCase()] || 'COACH') : 'COACH';
+
     return {
-      id: rawData.flight_id,
-      airline: rawData.airline,
-      flightNumber: rawData.flight_number,
-      aircraft: rawData.aircraft,
-      route: rawData.route,
-      schedule: rawData.schedule,
-      price: rawData.price,
-      availability: rawData.availability,
-      amenities: rawData.amenities || []
+      // This structure is purely hypothetical for a Google Flights API
+      request: {
+        slice: slices,
+        passengers: {
+          adultCount: parseInt(searchParams.adults, 10) || 1,
+          childCount: parseInt(searchParams.children, 10) || 0,
+          infantInLapCount: parseInt(searchParams.infantsInLap, 10) || 0,
+        },
+        maxPrice: searchParams.maxPrice ? `${searchParams.currency || 'USD'}${searchParams.maxPrice}` : undefined,
+        solutions: parseInt(searchParams.maxResults, 10) || 10, // Number of itineraries to return
+        saleCountry: searchParams.saleCountry || 'US', // Example, might be needed
+        ticketingCountry: searchParams.ticketingCountry || 'US', // Example
+        currencyCode: searchParams.currency || 'USD',
+        cabinRestriction: [{ cabin: googleCabin }]
+      },
     };
   }
 
   /**
-   * Format popular destinations
-   * @param {Object} rawData - Raw destinations data
-   * @returns {Array} - Formatted destinations
+   * Transforms the hypothetical Google Flights API response into our application's standard format.
+   * @param {object} googleResponseData - Raw data from the hypothetical Google Flights API.
+   * @param {object} originalSearchParams - The original search parameters.
+   * @returns {Array<object>} Array of standardized flight offers.
    */
-  formatDestinations(rawData) {
-    const destinations = rawData.destinations || [];
-    
-    return destinations.map(dest => ({
-      airport: dest.destination_id,
-      city: dest.destination_name,
-      country: dest.country,
-      price: dest.price,
-      currency: dest.currency,
-      image: dest.image
-    }));
+  _formatResponse(googleResponseData, originalSearchParams) {
+    // Assuming googleResponseData.tripOption is an array of flight solutions
+    // This structure is based on common patterns in flight APIs like QPX Express (which was retired)
+    const tripOptions = googleResponseData?.solutions?.tripOption || [];
+    const formattedOffers = [];
+
+    tripOptions.forEach((option, index) => {
+      const offerId = option.id || `gflight-${Date.now()}-${index}`;
+      const priceInfo = option.pricing?.[0]; // Assuming pricing is an array with one main pricing option
+
+      if (!priceInfo || !priceInfo.saleTotal) {
+          logger.warn(`Skipping trip option due to missing pricing info: ${offerId}`, { option });
+          return; // Skip if no pricing
+      }
+      
+      // Attempt to parse price and currency
+      const saleTotalMatch = priceInfo.saleTotal.match(/([A-Z]{3})?([\d,.]+)/);
+      const currencyCode = saleTotalMatch?.[1] || originalSearchParams.currency || 'USD';
+      const totalPrice = parseFloat(saleTotalMatch?.[2]?.replace(/,/g, '')) || 0;
+
+      const baseFareMatch = priceInfo.baseFareTotal?.match(/([A-Z]{3})?([\d,.]+)/);
+      const basePrice = baseFareMatch ? parseFloat(baseFareMatch[2]?.replace(/,/g, '')) : undefined;
+
+      const taxMatch = priceInfo.saleTaxTotal?.match(/([A-Z]{3})?([\d,.]+)/);
+      const taxPrice = taxMatch ? parseFloat(taxMatch[2]?.replace(/,/g, '')) : undefined;
+
+
+      const itineraries = (option.slice || []).map((slice, sliceIndex) => {
+        const segments = (slice.segment || []).map(seg => {
+          const leg = seg.leg?.[0]; // Assuming leg is an array and we take the first
+          if (!leg) return null;
+
+          return {
+            id: seg.id || `${offerId}-s${sliceIndex}-leg${leg.id || Date.now()}`,
+            departure: {
+              iataCode: leg.origin,
+              terminal: leg.originTerminal,
+              at: leg.departureTime, // Expected ISO 8601 format
+            },
+            arrival: {
+              iataCode: leg.destination,
+              terminal: leg.destinationTerminal,
+              at: leg.arrivalTime, // Expected ISO 8601 format
+            },
+            carrier: {
+              code: seg.flight?.carrier, // Airline code (e.g., "AA")
+              // name: carrierData[seg.flight.carrier]?.name || seg.flight.carrier // Need a carrier mapping
+            },
+            flightNumber: seg.flight?.number,
+            aircraft: { code: leg.aircraft }, // Aircraft type code
+            duration: leg.duration ? `PT${Math.floor(leg.duration / 60)}H${leg.duration % 60}M` : undefined, // Convert minutes to ISO duration
+            cabin: seg.cabin || originalSearchParams.cabin?.toUpperCase() || 'ECONOMY',
+            bookingClass: seg.bookingCode, // Fare booking class
+            numberOfStops: leg.connectionDuration ? 1 : 0, // Simplistic stop count based on connection
+          };
+        }).filter(Boolean); // Remove any null segments
+
+        return {
+          duration: slice.duration ? `PT${Math.floor(slice.duration / 60)}H${slice.duration % 60}M` : undefined,
+          segments: segments,
+        };
+      });
+
+      formattedOffers.push({
+        id: offerId,
+        provider: 'GoogleFlights', // Identify the source
+        type: 'flight-offer',
+        price: {
+          total: totalPrice,
+          currency: currencyCode,
+          base: basePrice,
+          taxes: taxPrice,
+          grandTotal: totalPrice, // For compatibility with some existing structures
+        },
+        itineraries: itineraries,
+        travelerPricings: [{ // Simplified pricing per traveler
+            travelerId: '1', // Assuming one adult for simplicity here
+            fareOption: 'STANDARD',
+            travelerType: 'ADULT',
+            price: {
+                currency: currencyCode,
+                total: totalPrice,
+                base: basePrice,
+            }
+        }],
+        // Other fields like baggage allowance, fare basis would need specific mapping from hypothetical API
+        // lastTicketingDate: priceInfo.latestTicketingTime,
+      });
+    });
+
+    return formattedOffers;
   }
 
   /**
-   * Validate airport code format
-   * @param {string} code - Airport code
-   * @returns {boolean} - Is valid
+   * Handles API errors from the hypothetical Google Flights API.
+   * Throws an AppError for standardized error handling.
+   * @param {Error} error - The error object from Axios.
+   * @param {string} context - Context of the error (e.g., 'search').
    */
-  isValidAirportCode(code) {
-    return /^[A-Z]{3}$/.test(code);
+  _handleApiError(error, context = 'search') {
+    let statusCode = 500;
+    let message = `Google Flights API request failed during ${context}.`;
+    let operational = false;
+    let providerErrors = null;
+
+    if (error.response) {
+      statusCode = error.response.status;
+      const responseData = error.response.data;
+      message = responseData?.error?.message || `Google Flights API Error (Status ${statusCode}) during ${context}.`;
+      providerErrors = responseData?.error?.errors || (responseData?.error ? [responseData.error] : null);
+
+      switch (statusCode) {
+        case 400: // Bad Request
+          message = `Invalid request to Google Flights API: ${message}`;
+          operational = true;
+          break;
+        case 401: // Unauthorized
+        case 403: // Forbidden
+          message = `Authentication/Authorization error with Google Flights API: ${message}`;
+          operational = true; // Could be bad API key
+          break;
+        case 429: // Too Many Requests
+          message = `Rate limit exceeded with Google Flights API: ${message}`;
+          operational = true;
+          break;
+        default:
+          operational = false; // Server-side errors are not typically operational from client's perspective
+      }
+    } else if (error.request) {
+      message = `No response received from Google Flights API during ${context}. Check network connectivity.`;
+      statusCode = 504; // Gateway Timeout
+    } else {
+      message = `Error setting up request to Google Flights API during ${context}: ${error.message}`;
+    }
+    // Log the original error for internal debugging
+    logger.error(`GoogleFlightsService Error (${context}):`, { originalError: error.message, status: statusCode, details: providerErrors });
+    throw new AppError(message, statusCode, operational, providerErrors);
   }
 
   /**
-   * Get service status
-   * @returns {Object} - Service status
+   * Searches for flights using the hypothetical Google Flights API.
+   * Uses caching to store and retrieve results.
+   * @param {object} searchParams - Parameters for flight search.
+   * @returns {Promise<object>} Standardized flight search results.
+   */
+  async searchFlights(searchParams) {
+    if (!this.apiKey) {
+      logger.error('GoogleFlightsService: API Key is not configured. Cannot perform search.');
+      // Fallback to empty results or throw specific error
+      // Consistent with other services, throw an AppError
+      throw new AppError('Google Flights API Key not configured. Flight search unavailable.', 503, true);
+    }
+
+    // The function to be cached
+    const fetchFromApi = async (params) => {
+      try {
+        const requestBody = this._formatRequest(params);
+        // Assuming the hypothetical Google Flights API uses POST for search
+        // The API key is typically added as a query param `?key=YOUR_API_KEY` by an interceptor or directly
+        const response = await this.client.post('/flights/search', requestBody.request); // Hypothetical endpoint
+
+        const formattedFlights = this._formatResponse(response.data, params);
+        return { // Standardized success response structure
+          success: true,
+          searchParams: params,
+          results: {
+            flights: formattedFlights,
+            totalResults: formattedFlights.length,
+          },
+          meta: {
+            currency: params.currency || 'USD',
+            searchTime: new Date().toISOString(),
+            provider: 'GoogleFlights',
+          },
+        };
+      } catch (error) {
+        // If error is already AppError from _handleApiError, rethrow it
+        if (error instanceof AppError) throw error;
+        // Otherwise, wrap it
+        this._handleApiError(error, `searchFlights with params: ${JSON.stringify(params).substring(0,100)}`);
+        // _handleApiError throws, so this line might not be reached unless it's modified
+        return { success: false, message: error.message, results: { flights: [], totalResults: 0 } };
+      }
+    };
+
+    try {
+      // Use cacheService.wrap to handle caching
+      return await cacheService.wrap(
+        CACHE_TYPE_GOOGLE_FLIGHTS,
+        searchParams,
+        fetchFromApi,
+        DEFAULT_CACHE_TTL_GOOGLE_FLIGHTS
+      );
+    } catch (error) {
+      // Log and rethrow or return a standardized error structure
+      logger.error('GoogleFlightsService searchFlights wrapper failed:', { errorMessage: error.message, searchParams });
+      // If it's an AppError, it already has good structure
+      if (error instanceof AppError) {
+        return { success: false, message: error.message, errors: error.errors, status: error.statusCode, results: { flights: [], totalResults: 0 } };
+      }
+      // For other errors, create a generic failure response
+      return {
+        success: false,
+        message: error.message || 'An unexpected error occurred during flight search.',
+        status: 500,
+        results: { flights: [], totalResults: 0 },
+        meta: { provider: 'GoogleFlights', searchTime: new Date().toISOString() }
+      };
+    }
+  }
+
+  /**
+   * Gets the operational status of the service.
+   * @returns {object} Service status.
    */
   getStatus() {
     return {
-      service: 'Google Flights API',
-      status: this.apiKey ? 'configured' : 'not_configured',
+      service: 'GoogleFlightsService',
+      status: this.apiKey ? 'configured_and_operational' : 'api_key_not_configured',
       baseURL: this.baseURL,
-      hasApiKey: !!this.apiKey
+      apiKeySet: !!this.apiKey,
+      notes: "This service integrates with a *hypothetical* Google Flights Data API. The actual Google Flights product does not offer such a public search API for general third-party use.",
     };
   }
 }
 
-module.exports = GoogleFlightsService; 
+module.exports = GoogleFlightsService;

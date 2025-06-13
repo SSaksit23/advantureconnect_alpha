@@ -1,18 +1,29 @@
+// backend/services/tripCustomizationService.js
 /**
  * Trip Customization Service
- * Integrates multiple APIs to create comprehensive travel packages
- * Combines flights, hotels, activities, and other travel services
+ * Orchestrates calls to various specialized services (flights, hotels, activities, etc.)
+ * to create comprehensive travel packages. It also handles direct calls for supplementary
+ * services like weather and currency conversion, applying caching where appropriate.
  */
 
-const axios = require('axios');
+const axios = require('axios'); // Keep for direct calls like weather, currency
 const winston = require('winston');
-const FlightApiService = require('./flightApiService');
+const env = require('../config/env');
+const cacheService = require('./cacheService');
+const { AppError } = require('../utils/responseHandler');
+
+// Import specialized API services
+const FlightApiService = require('./flightApiService'); // Assumes this service handles its own caching
+const HotelApiService = require('./hotelApiService');   // Assumes this service handles its own caching
+const ActivityApiService = require('./activityApiService'); // Assumes this service handles its own caching
 
 // Configure logger
 const logger = winston.createLogger({
-  level: 'info',
+  level: env.getEnv('LOG_LEVEL', 'info'),
   format: winston.format.combine(
-    winston.format.timestamp(),
+    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    winston.format.errors({ stack: true }),
+    winston.format.splat(),
     winston.format.json()
   ),
   defaultMeta: { service: 'trip-customization-service' },
@@ -23,136 +34,129 @@ const logger = winston.createLogger({
         winston.format.simple()
       )
     })
+    // Add file transports if needed
   ]
 });
 
+const CACHE_TYPE_WEATHER = 'weather_forecast';
+const CACHE_TYPE_CURRENCY = 'currency_rates';
+const DEFAULT_CACHE_TTL_WEATHER = env.getEnv('CACHE_WEATHER_TTL_SECONDS', 3 * 60 * 60, 'number'); // 3 hours
+const DEFAULT_CACHE_TTL_CURRENCY = env.getEnv('CACHE_CURRENCY_TTL_SECONDS', 24 * 60 * 60, 'number'); // 24 hours
+
 class TripCustomizationService {
-  constructor() {
-    this.flightApi = new FlightApiService();
+  constructor(amadeusSdkClient = null) { // Allow passing Amadeus SDK for specialized services
+    this.flightApi = new FlightApiService(); // FlightAPI.io or similar
+    // Pass the Amadeus SDK client to services that use it
+    this.hotelApi = new HotelApiService(amadeusSdkClient);
+    this.activityApi = new ActivityApiService(amadeusSdkClient);
+
+    // Direct Axios client for weather and currency (can be refactored into own services later if complex)
+    this.weatherApiKey = env.OPENWEATHER_API_KEY;
+    this.weatherApiBaseURL = 'https://api.openweathermap.org/data/2.5';
     
-    // Alternative hotel APIs (since Makcorps has issues)
-    this.hotelApis = {
-      // Booking.com API alternative - using RapidAPI
-      rapidapi: {
-        baseURL: 'https://booking-com.p.rapidapi.com/v1',
-        headers: {
-          'X-RapidAPI-Key': process.env.RAPIDAPI_KEY || 'demo-key',
-          'X-RapidAPI-Host': 'booking-com.p.rapidapi.com'
-        }
-      },
-      // Hotels.com API alternative
-      hotelscom: {
-        baseURL: 'https://hotels-com-provider.p.rapidapi.com/v2',
-        headers: {
-          'X-RapidAPI-Key': process.env.RAPIDAPI_KEY || 'demo-key',
-          'X-RapidAPI-Host': 'hotels-com-provider.p.rapidapi.com'
-        }
-      }
+    this.currencyApiBaseURL = 'https://api.exchangerate-api.com/v4/latest'; // Example, can be configured
+    this.currencyApiFallbackRates = { // Fallback if API fails
+        'USD': 1.0, 'EUR': 0.92, 'GBP': 0.79, 'JPY': 157.0, 'CAD': 1.37,
+        'AUD': 1.50, 'CHF': 0.89, 'CNY': 7.25, 'INR': 83.5, 'THB': 36.7,
     };
 
-    // Activities and attractions APIs
-    this.activityApis = {
-      // GetYourGuide API alternative
-      getyourguide: {
-        baseURL: 'https://getyourguide.p.rapidapi.com',
-        headers: {
-          'X-RapidAPI-Key': process.env.RAPIDAPI_KEY || 'demo-key',
-          'X-RapidAPI-Host': 'getyourguide.p.rapidapi.com'
-        }
-      },
-      // Viator API alternative
-      viator: {
-        baseURL: 'https://viator.p.rapidapi.com',
-        headers: {
-          'X-RapidAPI-Key': process.env.RAPIDAPI_KEY || 'demo-key',
-          'X-RapidAPI-Host': 'viator.p.rapidapi.com'
-        }
-      }
-    };
-
-    // Weather API for trip planning
-    this.weatherApi = {
-      baseURL: 'https://api.openweathermap.org/data/2.5',
-      apiKey: process.env.OPENWEATHER_API_KEY || 'demo-key'
-    };
-
-    // Currency conversion API
-    this.currencyApi = {
-      baseURL: 'https://api.exchangerate-api.com/v4/latest',
-      fallbackRates: {
-        'USD': 1.0,
-        'EUR': 0.85,
-        'GBP': 0.73,
-        'JPY': 110.0,
-        'CAD': 1.25,
-        'AUD': 1.35,
-        'CHF': 0.92,
-        'CNY': 6.45,
-        'INR': 74.5,
-        'THB': 33.0
-      }
-    };
+    if (!this.weatherApiKey) {
+      logger.warn('OPENWEATHER_API_KEY not set. Weather data will use mock fallbacks or fail.');
+    }
+    // No API key needed for the example exchangerate-api.com free tier
   }
 
   /**
-   * Create a comprehensive trip package
-   * @param {Object} tripParams - Trip parameters
-   * @returns {Promise<Object>} - Complete trip package
+   * Orchestrates the creation of a comprehensive trip package.
+   * @param {Object} tripParams - Trip parameters from the user/frontend.
+   *   Expected: origin, destinations (array of city codes/names), startDate, endDate,
+   *             travelers ({ adults, children, infants }), budget, preferences, currency.
+   * @returns {Promise<Object>} - Complete trip package with flights, hotels, activities, etc.
    */
   async createTripPackage(tripParams) {
+    const {
+      origin, // Assuming IATA code
+      destinations, // Array of destination objects { cityCode, name, durationDays } or just city codes
+      startDate, // YYYY-MM-DD
+      endDate,   // YYYY-MM-DD
+      travelers, // { adults: 1, children: 0, infants: 0, cabinClass: 'ECONOMY' }
+      budget,    // { amount: 1000, currency: 'USD' }
+      preferences, // { interests: ['culture'], travelStyle: 'balanced', pace: 'medium' }
+      currency = 'USD'
+    } = tripParams;
+
+    logger.info('Creating trip package with orchestrator', { tripParams });
+
     try {
-      const {
-        origin,
-        destinations,
-        startDate,
-        endDate,
-        travelers,
-        budget,
-        preferences,
-        currency = 'USD'
-      } = tripParams;
+      // 1. Search for flights (multi-leg if multiple destinations)
+      // This needs more sophisticated logic for multi-destination trips.
+      // For now, let's assume a primary flight search based on first/last destination.
+      const primaryDestination = destinations[0]?.cityCode || destinations[0]; // Assuming destinations is array of objects or strings
+      const lastDestination = destinations[destinations.length - 1]?.cityCode || destinations[destinations.length - 1];
+      
+      const flightSearchParams = {
+        origin: origin,
+        destination: primaryDestination, // Main destination for initial flight leg
+        departureDate: startDate,
+        returnDate: destinations.length === 1 ? endDate : undefined, // Only set returnDate for single destination trips
+        adults: travelers.adults,
+        children: travelers.children,
+        infants: travelers.infants,
+        cabinClass: travelers.cabinClass || 'ECONOMY',
+        currency: currency,
+      };
+      // If multi-destination, additional flight legs would be searched between destinations.
+      // This part needs significant expansion for true multi-city flight planning.
 
-      logger.info('Creating trip package', { tripParams });
-
-      // 1. Search for flights
-      const flightOptions = await this.searchFlights({
-        origin,
-        destinations,
-        startDate,
-        endDate,
-        travelers
-      });
+      const flightOptions = await this.searchFlights(flightSearchParams);
 
       // 2. Search for hotels in each destination
-      const hotelOptions = await this.searchHotels({
-        destinations,
-        startDate,
-        endDate,
-        travelers,
-        budget
-      });
+      // This requires iterating through destinations and their respective stay dates.
+      const hotelOptionsPerDestination = await Promise.all(
+        destinations.map(async (dest, index) => {
+          const destCityCode = dest.cityCode || dest; // Handle string array or object array
+          const checkIn = this._calculateDate(startDate, dest.arrivalDayOffset || (index * (dest.durationDays || 2) )); // Simplified date logic
+          const checkOut = this._calculateDate(checkIn, dest.durationDays || 2); // Simplified duration
+          
+          return this.searchHotels({
+            cityCode: destCityCode,
+            checkInDate: checkIn,
+            checkOutDate: checkOut,
+            adults: travelers.adults,
+            currency: currency,
+            // Add other hotel params like ratings, amenities from preferences
+          });
+        })
+      );
+      const hotelOptions = hotelOptionsPerDestination.flat(); // Flatten results if searchHotels returns arrays
 
-      // 3. Search for activities and attractions
-      const activityOptions = await this.searchActivities({
-        destinations,
-        startDate,
-        endDate,
-        preferences
-      });
+      // 3. Search for activities and POIs in each destination
+      const activityOptionsPerDestination = await Promise.all(
+        destinations.map(dest => {
+          const destCityCode = dest.cityCode || dest;
+          // Need geo-coordinates for Amadeus activity search. This requires a lookup.
+          // For now, assuming we can search by city name/code or have coordinates.
+          // This might require a preliminary location lookup service.
+          logger.warn(`Activity search for ${destCityCode} needs coordinates. Placeholder logic.`);
+          // Example: await this.activityApi.searchActivitiesByCoordinates({ latitude, longitude, radius: 10 });
+          return this.searchActivities({ destination: destCityCode, preferences });
+        })
+      );
+      const activityOptions = activityOptionsPerDestination.flat();
 
-      // 4. Get weather information
-      const weatherInfo = await this.getWeatherForecast({
-        destinations,
-        startDate,
-        endDate
-      });
+      // 4. Get weather information for primary destination
+      const weatherInfo = await this.getWeatherForecast({ destination: primaryDestination, startDate, endDate });
 
-      // 5. Calculate total costs and create packages
-      const tripPackages = await this.createTripPackages({
+      // 5. Get currency conversion rates if needed (e.g., budget currency vs. destination currency)
+      const currencyRates = await this.getCurrencyRates(budget?.currency || currency);
+
+      // 6. Assemble and price the package (this is complex logic)
+      const tripPackages = this._assembleTripPackages({
         flightOptions,
         hotelOptions,
         activityOptions,
         weatherInfo,
+        currencyRates,
         budget,
         currency,
         preferences
@@ -161,565 +165,261 @@ class TripCustomizationService {
       return {
         success: true,
         data: {
-          tripPackages,
-          flightOptions,
-          hotelOptions,
-          activityOptions,
-          weatherInfo,
+          tripPackages, // Array of assembled package options
+          // Raw components for detailed view:
+          // flightOptions,
+          // hotelOptions,
+          // activityOptions,
+          // weatherInfo,
+          // currencyRates,
           searchParams: tripParams
         },
         meta: {
           searchTime: new Date().toISOString(),
           currency,
-          totalPackages: tripPackages.length
         }
       };
 
     } catch (error) {
-      logger.error('Error creating trip package', error);
-      throw new Error(`Trip package creation failed: ${error.message}`);
+      logger.error('Error creating trip package via orchestrator', { error: error.message, stack: error.stack });
+      if (error instanceof AppError) throw error;
+      throw new AppError('Trip package creation failed due to an internal error.', 500);
+    }
+  }
+  
+  _calculateDate(baseDate, offsetDays) {
+      const date = new Date(baseDate);
+      date.setDate(date.getDate() + offsetDays);
+      return date.toISOString().split('T')[0];
+  }
+
+  async searchFlights(params) {
+    logger.info('TripCustomizationService: Delegating flight search to FlightApiService', { params });
+    try {
+      // FlightApiService is expected to handle its own caching and error formatting
+      return await this.flightApi.searchFlights(params);
+    } catch (error) {
+      logger.error('TripCustomizationService: Flight search failed.', { error: error.message });
+      // Return a consistent error structure or re-throw AppError
+      throw new AppError(error.message || 'Flight search failed.', error.status || 500, true, error.details);
     }
   }
 
-  /**
-   * Search for flights using FlightAPI.io
-   */
-  async searchFlights({ origin, destinations, startDate, endDate, travelers }) {
+  async searchHotels(params) {
+    logger.info('TripCustomizationService: Delegating hotel search to HotelApiService', { params });
     try {
-      const flightSearches = [];
+      // HotelApiService is expected to handle its own caching and error formatting
+      return await this.hotelApi.searchHotelsByCity(params); // Or other relevant method
+    } catch (error) {
+      logger.error('TripCustomizationService: Hotel search failed.', { error: error.message });
+      throw new AppError(error.message || 'Hotel search failed.', error.status || 500, true, error.details);
+    }
+  }
 
-      // Search outbound flights to each destination
-      for (const destination of destinations) {
-        try {
-          const outboundSearch = await this.flightApi.searchFlights({
-            origin,
-            destination,
-            departureDate: startDate,
-            adults: travelers.adults || 1,
-            children: travelers.children || 0,
-            infants: travelers.infants || 0,
-            cabinClass: travelers.cabinClass || 'economy'
-          });
+  async searchActivities(params) {
+    logger.info('TripCustomizationService: Delegating activity search to ActivityApiService', { params });
+    // ActivityApiService needs coordinates. This is a simplification.
+    // In a real app, you'd get coordinates for the destination first.
+    const mockCoordinates = { latitude: 48.8566, longitude: 2.3522 }; // Paris
+    try {
+      return await this.activityApi.searchActivitiesByCoordinates({
+        latitude: params.latitude || mockCoordinates.latitude,
+        longitude: params.longitude || mockCoordinates.longitude,
+        radius: params.radius || 10,
+        // startDate, endDate if API supports it
+      });
+    } catch (error) {
+      logger.error('TripCustomizationService: Activity search failed.', { error: error.message });
+      throw new AppError(error.message || 'Activity search failed.', error.status || 500, true, error.details);
+    }
+  }
 
-          if (outboundSearch.success) {
-            flightSearches.push({
-              type: 'outbound',
-              route: `${origin}-${destination}`,
-              flights: outboundSearch.data.flights
-            });
-          }
-        } catch (error) {
-          logger.warn(`Flight search failed for ${origin}-${destination}`, error);
-          // Add mock flights as fallback
-          flightSearches.push({
-            type: 'outbound',
-            route: `${origin}-${destination}`,
-            flights: this.createMockFlightsForRoute(origin, destination, startDate, travelers)
-          });
-        }
-      }
+  async getWeatherForecast({ destination, startDate, endDate }) {
+    if (!this.weatherApiKey) {
+      logger.warn('Weather API key not set. Returning mock weather data.');
+      return this._createMockWeather(destination, startDate, endDate);
+    }
 
-      // Search return flights
-      const lastDestination = destinations[destinations.length - 1];
+    // For OpenWeatherMap, forecast usually needs lat/lon.
+    // This is a simplified example; a real implementation would look up coords for 'destination'.
+    // Using a placeholder for coordinates.
+    const mockCoords = { lat: 48.85, lon: 2.35 }; // Paris
+    const cacheParams = { destinationName: destination, lat: mockCoords.lat, lon: mockCoords.lon, startDate, endDate };
+    
+    const fetchFn = async () => {
       try {
-        const returnSearch = await this.flightApi.searchFlights({
-          origin: lastDestination,
-          destination: origin,
-          departureDate: endDate,
-          adults: travelers.adults || 1,
-          children: travelers.children || 0,
-          infants: travelers.infants || 0,
-          cabinClass: travelers.cabinClass || 'economy'
+        // Example: 5-day/3-hour forecast (free tier)
+        // A more complex implementation would fetch daily for longer ranges if API supports.
+        const response = await axios.get(`${this.weatherApiBaseURL}/forecast`, {
+          params: {
+            lat: mockCoords.lat,
+            lon: mockCoords.lon,
+            appid: this.weatherApiKey,
+            units: 'metric', // Or 'imperial'
+          },
+          timeout: env.getEnv('WEATHER_API_TIMEOUT_MS', 10000, 'number'),
         });
-
-        if (returnSearch.success) {
-          flightSearches.push({
-            type: 'return',
-            route: `${lastDestination}-${origin}`,
-            flights: returnSearch.data.flights
-          });
-        }
+        // Format response.data.list into a daily summary
+        return this._formatWeatherData(response.data, destination, startDate, endDate);
       } catch (error) {
-        logger.warn(`Return flight search failed for ${lastDestination}-${origin}`, error);
-        // Add mock return flights as fallback
-        flightSearches.push({
-          type: 'return',
-          route: `${lastDestination}-${origin}`,
-          flights: this.createMockFlightsForRoute(lastDestination, origin, endDate, travelers)
-        });
+        logger.error('Weather forecast API error', { error: error.message, destination });
+        // Fallback to mock data on API failure
+        return this._createMockWeather(destination, startDate, endDate, true); // Mark as fallback
       }
-
-      return flightSearches;
-
-    } catch (error) {
-      logger.error('Flight search error', error);
-      return this.createMockFlights({ origin, destinations, startDate, endDate, travelers });
-    }
+    };
+    return cacheService.wrap(CACHE_TYPE_WEATHER, cacheParams, fetchFn, DEFAULT_CACHE_TTL_WEATHER);
   }
-
-  /**
-   * Search for hotels using mock data (since Makcorps has issues)
-   */
-  async searchHotels({ destinations, startDate, endDate, travelers, budget }) {
-    try {
-      const hotelSearches = [];
-
-      for (const destination of destinations) {
-        const hotelResults = this.createMockHotels(destination, startDate, endDate, travelers, budget);
-        hotelSearches.push({
-          destination,
-          hotels: hotelResults
-        });
-      }
-
-      return hotelSearches;
-
-    } catch (error) {
-      logger.error('Hotel search error', error);
-      return destinations.map(dest => ({
-        destination: dest,
-        hotels: this.createMockHotels(dest, startDate, endDate, travelers, budget)
-      }));
-    }
-  }
-
-  /**
-   * Search for activities and attractions
-   */
-  async searchActivities({ destinations, startDate, endDate, preferences }) {
-    try {
-      const activitySearches = [];
-
-      for (const destination of destinations) {
-        const activities = this.createMockActivities(destination, preferences);
-        activitySearches.push({
-          destination,
-          activities
-        });
-      }
-
-      return activitySearches;
-
-    } catch (error) {
-      logger.error('Activity search error', error);
-      return destinations.map(dest => ({
-        destination: dest,
-        activities: this.createMockActivities(dest, preferences)
-      }));
-    }
-  }
-
-  /**
-   * Get weather forecast for destinations
-   */
-  async getWeatherForecast({ destinations, startDate, endDate }) {
-    try {
-      const weatherData = [];
-
-      for (const destination of destinations) {
-        const weather = this.createMockWeather(destination, startDate, endDate);
-        weatherData.push({
-          destination,
-          weather
-        });
-      }
-
-      return weatherData;
-
-    } catch (error) {
-      logger.error('Weather forecast error', error);
-      return destinations.map(dest => ({
-        destination: dest,
-        weather: this.createMockWeather(dest, startDate, endDate)
-      }));
-    }
-  }
-
-  /**
-   * Create optimized trip packages
-   */
-  async createTripPackages({ flightOptions, hotelOptions, activityOptions, weatherInfo, budget, currency, preferences }) {
-    try {
-      const packages = [];
-
-      // Create budget-friendly package
-      const budgetPackage = {
-        id: 'budget',
-        name: 'Budget Explorer',
-        description: 'Affordable travel without compromising on experience',
-        totalPrice: 0,
-        currency,
-        components: {
-          flights: this.selectBudgetFlights(flightOptions),
-          hotels: this.selectBudgetHotels(hotelOptions),
-          activities: this.selectBudgetActivities(activityOptions)
-        },
-        savings: 0,
-        rating: 4.0,
-        highlights: ['Best value for money', 'Essential experiences included', 'Comfortable accommodations']
-      };
-
-      // Create mid-range package
-      const standardPackage = {
-        id: 'standard',
-        name: 'Comfort Traveler',
-        description: 'Perfect balance of comfort and value',
-        totalPrice: 0,
-        currency,
-        components: {
-          flights: this.selectStandardFlights(flightOptions),
-          hotels: this.selectStandardHotels(hotelOptions),
-          activities: this.selectStandardActivities(activityOptions)
-        },
-        savings: 0,
-        rating: 4.5,
-        highlights: ['Balanced comfort and price', 'Quality accommodations', 'Popular attractions included']
-      };
-
-      // Create luxury package
-      const luxuryPackage = {
-        id: 'luxury',
-        name: 'Premium Experience',
-        description: 'Luxury travel with premium services',
-        totalPrice: 0,
-        currency,
-        components: {
-          flights: this.selectLuxuryFlights(flightOptions),
-          hotels: this.selectLuxuryHotels(hotelOptions),
-          activities: this.selectLuxuryActivities(activityOptions)
-        },
-        savings: 0,
-        rating: 5.0,
-        highlights: ['Premium accommodations', 'Exclusive experiences', 'VIP services included']
-      };
-
-      // Calculate total prices
-      budgetPackage.totalPrice = this.calculatePackagePrice(budgetPackage.components);
-      standardPackage.totalPrice = this.calculatePackagePrice(standardPackage.components);
-      luxuryPackage.totalPrice = this.calculatePackagePrice(luxuryPackage.components);
-
-      // Calculate savings compared to luxury package
-      budgetPackage.savings = luxuryPackage.totalPrice - budgetPackage.totalPrice;
-      standardPackage.savings = luxuryPackage.totalPrice - standardPackage.totalPrice;
-
-      packages.push(budgetPackage, standardPackage, luxuryPackage);
-
-      // Filter packages by budget if specified
-      if (budget) {
-        return packages.filter(pkg => pkg.totalPrice <= budget);
-      }
-
-      return packages;
-
-    } catch (error) {
-      logger.error('Error creating trip packages', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Create mock flight data for a specific route
-   */
-  createMockFlightsForRoute(origin, destination, date, travelers) {
-    const airlines = ['AA', 'DL', 'UA', 'BA', 'LH', 'AF', 'KL', 'TK'];
-    
-    return Array.from({ length: 5 }, (_, i) => ({
-      id: `flight_${origin}_${destination}_${i}`,
-      airline: airlines[Math.floor(Math.random() * airlines.length)],
-      flightNumber: `${airlines[i % airlines.length]}${Math.floor(Math.random() * 9000) + 1000}`,
-      departure: {
-        airport: origin,
-        time: `${String(6 + i * 2).padStart(2, '0')}:${String(Math.floor(Math.random() * 60)).padStart(2, '0')}`,
-        date: date
-      },
-      arrival: {
-        airport: destination,
-        time: `${String(10 + i * 2).padStart(2, '0')}:${String(Math.floor(Math.random() * 60)).padStart(2, '0')}`,
-        date: date
-      },
-      duration: `${Math.floor(Math.random() * 8) + 2}h ${Math.floor(Math.random() * 60)}m`,
-      price: {
-        economy: Math.floor(Math.random() * 800) + 200,
-        business: Math.floor(Math.random() * 2000) + 1000,
-        first: Math.floor(Math.random() * 4000) + 3000
-      },
-      stops: Math.floor(Math.random() * 3),
-      aircraft: 'Boeing 737-800',
-      amenities: ['WiFi', 'Entertainment', 'Meals'],
-      baggage: {
-        carry: '1 x 8kg',
-        checked: '1 x 23kg'
-      }
-    }));
-  }
-
-  /**
-   * Create mock flight data
-   */
-  createMockFlights({ origin, destinations, startDate, endDate, travelers }) {
-    const flights = [];
-
-    destinations.forEach((dest) => {
-      flights.push({
-        type: 'outbound',
-        route: `${origin}-${dest}`,
-        flights: this.createMockFlightsForRoute(origin, dest, startDate, travelers)
+  
+  _formatWeatherData(apiData, destination, startDate, endDate) {
+      // Basic formatting: extract daily summaries from OpenWeatherMap 3-hour forecast
+      const dailyForecasts = {};
+      (apiData.list || []).forEach(item => {
+          const date = item.dt_txt.split(' ')[0];
+          if (!dailyForecasts[date]) {
+              dailyForecasts[date] = {
+                  temps: [],
+                  conditions: [],
+                  icons: [],
+                  humidity: [],
+                  wind: [],
+              };
+          }
+          dailyForecasts[date].temps.push(item.main.temp);
+          dailyForecasts[date].conditions.push(item.weather[0].description);
+          dailyForecasts[date].icons.push(item.weather[0].icon);
+          dailyForecasts[date].humidity.push(item.main.humidity);
+          dailyForecasts[date].wind.push(item.wind.speed);
       });
-    });
+      
+      const formatted = Object.keys(dailyForecasts).map(date => ({
+          date: date,
+          temp_min: Math.min(...dailyForecasts[date].temps),
+          temp_max: Math.max(...dailyForecasts[date].temps),
+          condition: dailyForecasts[date].conditions[Math.floor(dailyForecasts[date].conditions.length / 2)], // Mid-day condition
+          icon: `http://openweathermap.org/img/wn/${dailyForecasts[date].icons[Math.floor(dailyForecasts[date].icons.length / 2)]}@2x.png`,
+          humidity_avg: dailyForecasts[date].humidity.reduce((a,b) => a+b,0) / dailyForecasts[date].humidity.length,
+          wind_avg_kph: (dailyForecasts[date].wind.reduce((a,b) => a+b,0) / dailyForecasts[date].wind.length) * 3.6, // m/s to kph
+      }));
 
-    // Return flights
-    const lastDest = destinations[destinations.length - 1];
-    flights.push({
-      type: 'return',
-      route: `${lastDest}-${origin}`,
-      flights: this.createMockFlightsForRoute(lastDest, origin, endDate, travelers)
-    });
+      return {
+          destination,
+          forecast: formatted.filter(f => f.date >= startDate && f.date <= endDate), // Filter by trip dates
+          summary: `Weather forecast for ${destination}.`,
+          isFallback: false,
+      };
+  }
 
-    return flights;
+  async getCurrencyRates(baseCurrency = 'USD') {
+    const cacheParams = { base: baseCurrency };
+    const fetchFn = async () => {
+      try {
+        const response = await axios.get(`${this.currencyApiBaseURL}/${baseCurrency}`, {
+            timeout: env.getEnv('CURRENCY_API_TIMEOUT_MS', 5000, 'number'),
+        });
+        return {
+          base: response.data.base_code || response.data.base,
+          rates: response.data.rates,
+          last_updated_unix: response.data.time_last_update_unix || response.data.time_last_updated,
+          isFallback: false,
+        };
+      } catch (error) {
+        logger.error('Currency conversion API error', { error: error.message, baseCurrency });
+        return { // Fallback to static rates
+          base: baseCurrency,
+          rates: this.currencyApiFallbackRates,
+          last_updated_unix: Math.floor(Date.now() / 1000),
+          isFallback: true,
+        };
+      }
+    };
+    return cacheService.wrap(CACHE_TYPE_CURRENCY, cacheParams, fetchFn, DEFAULT_CACHE_TTL_CURRENCY);
   }
 
   /**
-   * Create mock hotel data
+   * Assembles different trip packages based on fetched options and budget.
+   * This is a complex piece of logic that would typically involve:
+   * - Filtering options based on preferences (e.g., direct flights, hotel ratings).
+   * - Combining components into viable packages.
+   * - Pricing packages and comparing against budget.
+   * - Potentially using AI/rules to create "budget", "standard", "luxury" options.
+   * For now, this is a simplified placeholder.
    */
-  createMockHotels(destination, checkIn, checkOut, travelers, budget) {
-    const hotelTypes = ['Budget Inn', 'Comfort Hotel', 'Business Hotel', 'Luxury Resort', 'Boutique Hotel'];
-    const amenities = ['WiFi', 'Pool', 'Gym', 'Spa', 'Restaurant', 'Bar', 'Parking', 'Airport Shuttle'];
+  _assembleTripPackages({ flightOptions, hotelOptions, activityOptions, weatherInfo, currencyRates, budget, currency, preferences }) {
+    logger.info('Assembling trip packages (simplified logic)...');
+    // This is where sophisticated package creation logic would go.
+    // For this example, let's just create one representative package.
     
-    return Array.from({ length: 10 }, (_, i) => ({
-      id: `hotel_${destination}_${i}`,
-      name: `${hotelTypes[i % hotelTypes.length]} ${destination}`,
-      description: `Beautiful ${hotelTypes[i % hotelTypes.length].toLowerCase()} in the heart of ${destination}`,
-      location: {
-        address: `${Math.floor(Math.random() * 999) + 1} Main Street, ${destination}`,
-        coordinates: {
-          lat: 40.7128 + (Math.random() - 0.5) * 0.1,
-          lng: -74.0060 + (Math.random() - 0.5) * 0.1
-        },
-        distanceFromCenter: `${(Math.random() * 5).toFixed(1)} km`
-      },
-      rating: {
-        stars: Math.floor(Math.random() * 3) + 3,
-        score: (Math.random() * 2 + 3).toFixed(1),
-        reviewCount: Math.floor(Math.random() * 2000) + 100
-      },
-      price: {
-        perNight: Math.floor(Math.random() * 300) + 50,
-        total: Math.floor(Math.random() * 1500) + 250,
-        currency: 'USD',
-        taxes: Math.floor(Math.random() * 50) + 10
-      },
-      amenities: amenities.slice(0, Math.floor(Math.random() * 5) + 3),
-      images: [
-        `https://images.unsplash.com/photo-1566073771259-6a8506099945?w=400`,
-        `https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=400`
-      ],
-      availability: {
-        checkIn,
-        checkOut,
-        rooms: Math.floor(Math.random() * 10) + 1,
-        maxGuests: (travelers.adults || 1) + (travelers.children || 0)
-      },
-      cancellation: 'Free cancellation until 24 hours before check-in',
-      breakfast: Math.random() > 0.5 ? 'Included' : 'Not included'
-    }));
+    const selectedFlight = flightOptions?.results?.flights?.[0];
+    const selectedHotel = hotelOptions?.[0]?.results?.hotels?.[0]; // Assuming hotelOptions is an array of search results per destination
+    const selectedActivity = activityOptions?.[0]?.results?.items?.[0];
+
+    let totalPrice = 0;
+    if (selectedFlight) totalPrice += selectedFlight.price?.total || 0;
+    if (selectedHotel) totalPrice += selectedHotel.offerDetails?.price?.total || selectedHotel.price?.perNight || 0; // Adjust based on hotel structure
+    if (selectedActivity) totalPrice += selectedActivity.price?.amount || 0;
+    
+    const mainPackage = {
+      id: 'package_main_01',
+      name: `Curated Trip to ${preferences?.primaryDestination || 'Your Destination'}`,
+      description: 'A balanced trip package with good value flights, comfortable hotels, and exciting activities.',
+      totalPrice: parseFloat(totalPrice.toFixed(2)),
+      currency: currency,
+      components: [],
+      matchesBudget: budget?.amount ? totalPrice <= budget.amount : true,
+    };
+
+    if (selectedFlight) mainPackage.components.push({ type: 'flight', details: selectedFlight });
+    if (selectedHotel) mainPackage.components.push({ type: 'hotel', details: selectedHotel });
+    if (selectedActivity) mainPackage.components.push({ type: 'activity', details: selectedActivity });
+    
+    // Add weather and currency info to package meta or directly
+    mainPackage.weatherForecast = weatherInfo;
+    mainPackage.currencyInfo = currencyRates;
+
+    return [mainPackage]; // Return array of packages
   }
 
-  /**
-   * Create mock activity data
-   */
-  createMockActivities(destination, preferences) {
-    const activityTypes = ['Tour', 'Museum', 'Adventure', 'Cultural', 'Food', 'Shopping', 'Entertainment'];
-    const activities = [];
-
-    activityTypes.forEach((type, index) => {
-      activities.push({
-        id: `activity_${destination}_${type}_${index}`,
-        name: `${type} Experience in ${destination}`,
-        description: `Amazing ${type.toLowerCase()} experience showcasing the best of ${destination}`,
-        type: type.toLowerCase(),
-        duration: `${Math.floor(Math.random() * 6) + 2} hours`,
-        price: {
-          adult: Math.floor(Math.random() * 100) + 20,
-          child: Math.floor(Math.random() * 50) + 10,
-          currency: 'USD'
-        },
-        rating: {
-          score: (Math.random() * 2 + 3).toFixed(1),
-          reviewCount: Math.floor(Math.random() * 1000) + 50
-        },
-        location: {
-          name: `${destination} ${type} Center`,
-          address: `${Math.floor(Math.random() * 999) + 1} Tourist Street, ${destination}`
-        },
-        availability: {
-          times: ['09:00', '11:00', '14:00', '16:00'],
-          languages: ['English', 'Spanish', 'French']
-        },
-        includes: ['Guide', 'Transportation', 'Entry fees'],
-        images: [
-          `https://images.unsplash.com/photo-1539650116574-75c0c6d73f6e?w=400`,
-          `https://images.unsplash.com/photo-1513475382585-d06e58bcb0e0?w=400`
-        ]
-      });
-    });
-
-    return activities;
-  }
-
-  /**
-   * Create mock weather data
-   */
-  createMockWeather(destination, startDate, endDate) {
+  // --- Mock Data Fallbacks (to be used if API keys missing or APIs fail) ---
+  _createMockWeather(destination, startDate, endDate, isApiFallback = false) {
     const conditions = ['Sunny', 'Partly Cloudy', 'Cloudy', 'Light Rain', 'Clear'];
     const start = new Date(startDate);
     const end = new Date(endDate);
-    const days = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
+    const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)));
 
     return {
       destination,
-      forecast: Array.from({ length: Math.max(days, 1) }, (_, i) => {
+      forecast: Array.from({ length: days }, (_, i) => {
         const date = new Date(start);
         date.setDate(date.getDate() + i);
-        
         return {
           date: date.toISOString().split('T')[0],
           condition: conditions[Math.floor(Math.random() * conditions.length)],
-          temperature: {
-            high: Math.floor(Math.random() * 15) + 20,
-            low: Math.floor(Math.random() * 10) + 10,
-            unit: 'C'
-          },
-          humidity: Math.floor(Math.random() * 40) + 40,
-          windSpeed: Math.floor(Math.random() * 20) + 5,
-          precipitation: Math.floor(Math.random() * 30)
+          temp_min: Math.floor(Math.random() * 10) + 10, // 10-19 C
+          temp_max: Math.floor(Math.random() * 10) + 20, // 20-29 C
+          icon: 'mock_icon_url', // Placeholder
         };
       }),
-      summary: `Generally pleasant weather in ${destination} with temperatures ranging from 15-30°C`
+      summary: `Mock weather for ${destination}.`,
+      isFallback: true,
+      isApiFallback,
     };
   }
 
-  /**
-   * Helper methods for package selection
-   */
-  selectBudgetFlights(flightOptions) {
-    return flightOptions.map(option => ({
-      ...option,
-      selectedFlight: option.flights.sort((a, b) => a.price.economy - b.price.economy)[0]
-    }));
-  }
-
-  selectStandardFlights(flightOptions) {
-    return flightOptions.map(option => ({
-      ...option,
-      selectedFlight: option.flights[Math.floor(option.flights.length / 2)]
-    }));
-  }
-
-  selectLuxuryFlights(flightOptions) {
-    return flightOptions.map(option => ({
-      ...option,
-      selectedFlight: option.flights.sort((a, b) => b.price.business - a.price.business)[0]
-    }));
-  }
-
-  selectBudgetHotels(hotelOptions) {
-    return hotelOptions.map(option => ({
-      ...option,
-      selectedHotel: option.hotels.sort((a, b) => a.price.perNight - b.price.perNight)[0]
-    }));
-  }
-
-  selectStandardHotels(hotelOptions) {
-    return hotelOptions.map(option => ({
-      ...option,
-      selectedHotel: option.hotels.filter(h => h.rating.stars >= 3 && h.rating.stars <= 4)[0] || option.hotels[0]
-    }));
-  }
-
-  selectLuxuryHotels(hotelOptions) {
-    return hotelOptions.map(option => ({
-      ...option,
-      selectedHotel: option.hotels.filter(h => h.rating.stars >= 4)[0] || option.hotels[0]
-    }));
-  }
-
-  selectBudgetActivities(activityOptions) {
-    return activityOptions.map(option => ({
-      ...option,
-      selectedActivities: option.activities.sort((a, b) => a.price.adult - b.price.adult).slice(0, 2)
-    }));
-  }
-
-  selectStandardActivities(activityOptions) {
-    return activityOptions.map(option => ({
-      ...option,
-      selectedActivities: option.activities.slice(0, 3)
-    }));
-  }
-
-  selectLuxuryActivities(activityOptions) {
-    return activityOptions.map(option => ({
-      ...option,
-      selectedActivities: option.activities.slice(0, 5)
-    }));
-  }
-
-  /**
-   * Calculate total package price
-   */
-  calculatePackagePrice(components) {
-    let total = 0;
-
-    // Add flight costs
-    components.flights.forEach(flight => {
-      if (flight.selectedFlight) {
-        total += flight.selectedFlight.price.economy;
-      }
-    });
-
-    // Add hotel costs
-    components.hotels.forEach(hotel => {
-      if (hotel.selectedHotel) {
-        total += hotel.selectedHotel.price.total;
-      }
-    });
-
-    // Add activity costs
-    components.activities.forEach(activity => {
-      if (activity.selectedActivities) {
-        activity.selectedActivities.forEach(act => {
-          total += act.price.adult;
-        });
-      }
-    });
-
-    return Math.round(total);
-  }
-
-  /**
-   * Get service status
-   */
   getStatus() {
     return {
-      service: 'Trip Customization Service',
+      service: 'Trip Customization Service (Orchestrator)',
       status: 'operational',
-      integrations: {
+      dependencies: {
         flightApi: this.flightApi.getStatus(),
-        hotelApis: 'mock_data_available',
-        activityApis: 'mock_data_available',
-        weatherApi: 'mock_data_available'
+        hotelApi: this.hotelApi.getStatus(),
+        activityApi: this.activityApi.getStatus(),
+        weatherApi: this.weatherApiKey ? 'configured' : 'not_configured (using mocks)',
+        currencyApi: 'configured (using public API with fallbacks)',
+        cacheService: cacheService.redisAvailable ? 'Redis available' : 'Redis unavailable (DB cache only or no cache)',
       },
-      features: [
-        'Multi-destination trip planning',
-        'Flight search and booking',
-        'Hotel recommendations',
-        'Activity suggestions',
-        'Weather forecasting',
-        'Budget optimization',
-        'Package customization'
-      ]
+      notes: 'Orchestrates various travel services to build trip packages. Uses caching for weather and currency.',
     };
   }
 }
 
-module.exports = TripCustomizationService; 
+module.exports = TripCustomizationService;

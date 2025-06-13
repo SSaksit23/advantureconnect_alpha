@@ -2,6 +2,8 @@
 const jwt = require('jsonwebtoken');
 const pool = require('../models/database');
 const winston = require('winston');
+const env = require('../config/env'); // Centralised environment variables
+const { isBlacklisted } = require('../services/redisService'); // Redis token blacklist checker
 
 // Configure logger for this middleware
 const logger = winston.createLogger({
@@ -36,8 +38,24 @@ const authenticateToken = async (req, res, next) => {
     });
   }
 
+  // ----- Redis Blacklist Check -----
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_jwt_secret_change_in_production');
+    const blacklisted = await isBlacklisted(token);
+    if (blacklisted) {
+      logger.warn('Blacklisted token intercepted. Access denied.', { path: req.path });
+      return res.status(401).json({
+        success: false,
+        message: 'Token has been revoked. Please log in again.'
+      });
+    }
+  } catch (err) {
+    // Fail-open strategy already implemented in isBlacklisted, but log here as well
+    logger.error('Error while checking token blacklist status.', { error: err.message, path: req.path });
+  }
+
+  try {
+    // env.JWT_SECRET is validated at application startup – no insecure fallback
+    const decoded = jwt.verify(token, env.JWT_SECRET);
     
     // Get user from database
     const result = await pool.query(

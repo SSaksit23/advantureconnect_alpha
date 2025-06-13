@@ -1,10 +1,9 @@
 // ==========================================
 // FILE 2: frontend/src/components/HotelSearch.js
 // REPLACE THE ENTIRE FILE WITH THIS CONTENT
-// ==========================================
-
+// ==========================================\n
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
+import apiClient from '../../services/apiClient'; // Import the global apiClient
 
 const HotelSearch = ({ flightData }) => {
   const [searchParams, setSearchParams] = useState({
@@ -20,8 +19,6 @@ const HotelSearch = ({ flightData }) => {
   const [searchResults, setSearchResults] = useState(null);
   const [showCityDropdown, setShowCityDropdown] = useState(false);
   const [selectedHotel, setSelectedHotel] = useState(null);
-
-  const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
 
   // Auto-populate from flight data
   useEffect(() => {
@@ -43,7 +40,7 @@ const HotelSearch = ({ flightData }) => {
     }
     
     try {
-      const response = await axios.get(`${API_BASE_URL}/locations/search?keyword=${encodeURIComponent(query)}`);
+      const response = await apiClient.get(`/locations/search?keyword=${encodeURIComponent(query)}`);
       const cities = response.data.filter(location => 
         location.type === 'CITY' || 
         (location.type === 'AIRPORT' && location.city)
@@ -100,7 +97,7 @@ const HotelSearch = ({ flightData }) => {
         adults: searchParams.adults.toString()
       });
 
-      const response = await axios.get(`${API_BASE_URL}/hotels/search?${queryParams}`);
+      const response = await apiClient.get(`/hotels/search?${queryParams}`);
       setSearchResults(response.data);
     } catch (error) {
       console.error('Error searching hotels:', error);

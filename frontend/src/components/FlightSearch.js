@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import axios from 'axios';
+import apiClient from '../../services/apiClient'; // Import the global apiClient
 
 const FlightSearch = ({ onFlightSelect }) => {
   const [searchParams, setSearchParams] = useState({
@@ -18,7 +18,7 @@ const FlightSearch = ({ onFlightSelect }) => {
   const [showOriginDropdown, setShowOriginDropdown] = useState(false);
   const [showDestinationDropdown, setShowDestinationDropdown] = useState(false);
 
-  const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+  // API_BASE_URL is no longer needed here as apiClient is pre-configured
 
   const searchLocations = async (query, setSuggestions) => {
     if (query.length < 2) {
@@ -27,7 +27,8 @@ const FlightSearch = ({ onFlightSelect }) => {
     }
     
     try {
-      const response = await axios.get(`${API_BASE_URL}/locations/search?keyword=${encodeURIComponent(query)}`);
+      // Use apiClient for the request
+      const response = await apiClient.get(`/locations/search?keyword=${encodeURIComponent(query)}`);
       setSuggestions(response.data || []);
     } catch (error) {
       console.error('Error searching locations:', error);
@@ -89,7 +90,8 @@ const FlightSearch = ({ onFlightSelect }) => {
         requestBody.returnDate = searchParams.returnDate;
       }
 
-      const response = await axios.post(`${API_BASE_URL}/flights/search`, requestBody);
+      // Use apiClient for the POST request
+      const response = await apiClient.post(`/flights/search`, requestBody);
       setSearchResults(response.data);
       
       if (onFlightSelect) {

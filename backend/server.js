@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
+// const dotenv = require('dotenv'); // Replaced by centralized env config
 const helmet = require('helmet');
 const compression = require('compression');
 const morgan = require('morgan');
@@ -11,23 +11,29 @@ const rateLimit = require('express-rate-limit');
 const http = require('http'); // For Socket.IO and graceful shutdown
 const { Server } = require("socket.io"); // For Socket.IO
 
-// Load environment variables
-dotenv.config();
+// --- Centralized Environment Configuration & Validation ---
+const env = require('./config/env');
+env.validateRequiredEnvVars(); // Validate critical environment variables *before* anything else boots
 
 // --- Custom Modules ---
-const { pool, connectRedis, redisClient: directRedisClient } = require('./models/database'); // Assuming redisClient is exported after connection
+const { pool, connectRedis, redisClient: directRedisClient } = require('./models/database');
 const authRoutes = require('./routes/auth');
 const flightRoutes = require('./routes/flights');
 const hotelRoutes = require('./routes/hotels');
 const tripCustomizationRoutes = require('./routes/tripCustomization');
-// const providerRoutes = require('./routes/providers'); // Temporarily disabled - complex provider system
+// const providerRoutes = require('./routes/providers'); // Temporarily disabled
 const tripRoutes = require('./routes/trips');
 const searchRoutes = require('./routes/search');
 // const recommendationsRoutes = require('./routes/recommendations'); // Temporarily disabled
 
+// --- Response and Error Handling Utilities ---
+const { successResponse, errorResponse, AppError } = require('./utils/responseHandler');
+const globalErrorHandler = require('./middleware/errorHandler');
+const { csrfProtection } = require('./middleware/csrf');
+
 // --- Winston Logger Setup ---
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
+  level: env.logLevel, // Use env.logLevel
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     winston.format.errors({ stack: true }),
@@ -42,7 +48,7 @@ const logger = winston.createLogger({
   ],
 });
 
-if (process.env.NODE_ENV !== 'production') {
+if (env.env !== 'production') {
   logger.add(new winston.transports.Console({
     format: winston.format.combine(
       winston.format.colorize(),
@@ -61,34 +67,41 @@ const morganStream = {
 // --- Initialize Express App ---
 const app = express();
 const server = http.createServer(app); // Create HTTP server for Express and Socket.IO
-const port = process.env.PORT || 5000;
+const port = env.port; // Use env.port
 
 // --- Initialize Amadeus Client ---
-// Ensure AMADEUS_CLIENT_ID, AMADEUS_CLIENT_SECRET, and AMADEUS_HOSTNAME are set in your .env file
 const amadeus = new Amadeus({
-  clientId: process.env.AMADEUS_CLIENT_ID,
-  clientSecret: process.env.AMADEUS_CLIENT_SECRET,
-  hostname: process.env.AMADEUS_HOSTNAME || 'test', // Defaults to test environment
-  logger: logger, 
-  logLevel: process.env.NODE_ENV === 'development' ? 'debug' : 'silent'
+  clientId: env.AMADEUS_CLIENT_ID, // Use env
+  clientSecret: env.AMADEUS_CLIENT_SECRET, // Use env
+  hostname: env.AMADEUS_HOSTNAME || 'test', // Use env, default to 'test'
+  logger: logger,
+  logLevel: env.env === 'development' ? 'debug' : 'silent' // Use env
 });
 
 // --- Connect to Redis ---
-let redisClientInstance;
+let redisClientInstance; // To store the connected client from connectRedis
 connectRedis()
   .then(client => {
-    redisClientInstance = client;
+    redisClientInstance = client; // Store the client instance
     logger.info('Redis connected successfully for the main application.');
+    // Make redisClientInstance available to other modules if needed, e.g., app.set('redisClient', redisClientInstance);
+    // For CSRF and Cache services, they import `redisClient` from `models/database.js` directly.
   })
   .catch(err => {
     logger.error('Failed to connect to Redis for the main application:', err);
-    // Potentially exit or run in a degraded mode
+    // Consider implications if Redis is critical (e.g., for CSRF, Caching, Sessions)
+    // The application might need to run in a degraded mode or exit.
+    // For now, CSRF and Cache services have internal checks for Redis availability.
   });
 
 // --- Socket.IO Setup ---
+const corsOrigins = env.CORS_ORIGIN
+  ? env.CORS_ORIGIN.split(',').map(origin => origin.trim())
+  : ['http://localhost:3000', 'http://127.0.0.1:3000']; // Default if not set
+
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : "http://localhost:3000",
+    origin: corsOrigins,
     methods: ["GET", "POST"]
   }
 });
@@ -104,45 +117,66 @@ app.set('socketio', io);
 
 // --- Core Middleware ---
 app.use(cors({
-  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : ['http://localhost:3000', 'http://127.0.0.1:3000'],
+  origin: corsOrigins,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  // Ensure X-CSRF-Token is allowed if not covered by default
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token']
 }));
-app.use(helmet()); 
-app.use(compression()); 
-app.use(express.json({ limit: '10mb' })); 
-app.use(express.urlencoded({ extended: true, limit: '10mb' })); 
+app.use(helmet());
+app.use(compression());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(morgan(':method :url :status :res[content-length] - :response-time ms', { stream: morganStream }));
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 
-// --- Rate Limiting ---
+// --- Rate Limiting ---\
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, 
-  max: 200, 
-  standardHeaders: true, 
-  legacyHeaders: false, 
+  windowMs: 15 * 60 * 1000,
+  max: env.getEnv('RATE_LIMIT_GENERAL_MAX', 200, 'number'), // Configurable
+  standardHeaders: true,
+  legacyHeaders: false,
   message: 'Too many requests from this IP, please try again after 15 minutes.',
   handler: (req, res, next, options) => {
     logger.warn(`Rate limit exceeded for IP ${req.ip}`, { path: req.path, limit: options.max, windowMs: options.windowMs });
-    res.status(options.statusCode).json({ message: options.message });
+    // Use standardized error response
+    errorResponse(res, options.statusCode, options.message);
   }
 });
 app.use(generalLimiter);
 
 const authLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000, 
-  max: 10, 
+  windowMs: 5 * 60 * 1000,
+  max: env.getEnv('RATE_LIMIT_AUTH_MAX', 10, 'number'), // Configurable
   message: 'Too many authentication attempts, please try again after 5 minutes.',
   handler: (req, res, next, options) => {
     logger.warn(`Auth rate limit exceeded for IP ${req.ip}`, { path: req.path, limit: options.max, windowMs: options.windowMs });
-    res.status(options.statusCode).json({ message: options.message });
+    // Use standardized error response
+    errorResponse(res, options.statusCode, options.message);
   }
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
+
+// --- CSRF Protection Middleware ---
+// Paths exempt from CSRF protection (e.g., login, register, token refresh, CSRF token fetch)
+const CSRF_EXEMPT_PATHS = new Set([
+  '/api/auth/login',
+  '/api/auth/register',
+  '/api/auth/refresh',
+  '/api/auth/csrf-token'
+  // Add other paths like webhook endpoints if necessary
+]);
+
+app.use((req, res, next) => {
+  if (CSRF_EXEMPT_PATHS.has(req.path)) {
+    return next();
+  }
+  // Apply csrfProtection middleware to all other relevant requests
+  return csrfProtection(req, res, next);
+});
 
 
 // --- API Routes ---
@@ -162,78 +196,63 @@ app.get('/api/health', async (req, res) => {
     const dbStatus = 'Connected';
 
     let redisStatus = 'Disconnected';
-    if (redisClientInstance && redisClientInstance.isOpen) {
-        await redisClientInstance.ping();
-        redisStatus = 'Connected';
-    } else if (directRedisClient && directRedisClient.isOpen) { 
-        await directRedisClient.ping();
-        redisStatus = 'Connected';
+    // Use the stored redisClientInstance or directRedisClient from models/database
+    const currentRedisClient = redisClientInstance || directRedisClient;
+    if (currentRedisClient && currentRedisClient.isOpen) {
+        try {
+            await currentRedisClient.ping();
+            redisStatus = 'Connected';
+        } catch (pingError) {
+            logger.warn('Health Check: Redis ping failed.', { error: pingError.message });
+            redisStatus = 'Ping Failed';
+        }
     }
 
-    res.json({
+    const healthData = {
       status: 'OK',
       timestamp: new Date().toISOString(),
       message: 'AdventureConnect Backend is running and healthy!',
       services: {
         database: dbStatus,
         redis: redisStatus,
-        amadeus: 'Configured',
-        flightapi: process.env.FLIGHTAPI_KEY ? 'Configured' : 'Not Configured',
-        makcorps: process.env.MAKCORPS_API_KEY ? 'Configured' : 'Not Configured',
+        amadeus: (env.AMADEUS_CLIENT_ID && env.AMADEUS_CLIENT_SECRET) ? 'Configured' : 'Not Configured',
+        flightapi: env.FLIGHT_API_KEY ? 'Configured' : 'Not Configured',
+        // makcorps: env.MAKCORPS_API_KEY ? 'Configured' : 'Not Configured', // Assuming this is removed or replaced
+        googleFlights: env.GOOGLE_FLIGHTS_API_KEY ? 'Configured (Hypothetical)' : 'Not Configured',
         tripCustomization: 'Operational'
       },
-      uptime: process.uptime() 
-    });
+      uptime: process.uptime()
+    };
+    successResponse(res, 200, 'System health is OK.', healthData);
   } catch (error) {
     logger.error('Health check failed:', error);
-    res.status(503).json({
-      status: 'Service Unavailable',
-      timestamp: new Date().toISOString(),
-      message: 'One or more services are down.',
-      error: error.message,
-      details: {
-        database: error.message.includes('database') || error.message.includes('PostgreSQL') ? 'Error' : 'Connected',
-        redis: error.message.includes('redis') ? 'Error' : 'Connected',
-      }
-    });
+    // Use AppError for structured error to be handled by globalErrorHandler
+    // Or directly use errorResponse if preferred for health check specifics
+    const healthErrorDetails = {
+        database: error.message.includes('database') || error.message.includes('PostgreSQL') ? 'Error' : 'Potentially Connected',
+        redis: error.message.includes('redis') ? 'Error' : 'Potentially Connected',
+        details: error.message
+    };
+    errorResponse(res, 503, 'One or more critical services are down.', healthErrorDetails);
   }
 });
 
 
 // --- 404 Not Found Handler ---
+// This should come after all valid routes
 app.use((req, res, next) => {
-  const error = new Error(`Not Found - ${req.originalUrl}`);
-  error.status = 404;
-  next(error);
+  // Create an AppError for 404s
+  next(new AppError(`The requested URL ${req.originalUrl} was not found on this server.`, 404));
 });
 
 // --- Global Error Handler ---
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
-  logger.error(`${err.status || 500} - ${err.message} - ${req.originalUrl} - ${req.method} - ${req.ip}`, {
-    error: {
-      message: err.message,
-      status: err.status,
-      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined, 
-      path: req.originalUrl,
-      method: req.method,
-      ip: req.ip
-    }
-  });
+// This must be the last piece of middleware
+app.use(globalErrorHandler);
 
-  res.status(err.status || 500);
-  res.json({
-    error: {
-      message: err.message || 'An unexpected error occurred.',
-      ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
-    },
-  });
-});
-
-// --- Start Server and Graceful Shutdown ---
+// --- Start Server and Graceful Shutdown ---\
 const startServer = () => {
-  server.listen(port, '0.0.0.0', () => {
-    logger.info(`🚀 AdventureConnect Backend running on port ${port} in ${process.env.NODE_ENV || 'development'} mode`);
+  server.listen(port, '0.0.0.0', () => { // Listen on 0.0.0.0 for Docker compatibility
+    logger.info(`🚀 AdventureConnect Backend running on port ${port} in ${env.env} mode`);
     logger.info(`✅ Health check available at http://localhost:${port}/api/health`);
     logger.info('Press Ctrl-C to stop\n');
   });
@@ -250,12 +269,10 @@ const gracefulShutdown = async (signal) => {
       logger.error('Error closing PostgreSQL pool:', e);
     }
     try {
-      if (redisClientInstance && redisClientInstance.isOpen) {
-        await redisClientInstance.quit();
+      const currentRedisClient = redisClientInstance || directRedisClient;
+      if (currentRedisClient && currentRedisClient.isOpen) {
+        await currentRedisClient.quit();
         logger.info('Redis client disconnected.');
-      } else if (directRedisClient && directRedisClient.isOpen) {
-        await directRedisClient.quit();
-        logger.info('Direct Redis client disconnected.');
       }
     } catch (e) {
       logger.error('Error closing Redis client:', e);
@@ -263,24 +280,33 @@ const gracefulShutdown = async (signal) => {
     process.exit(0);
   });
 
+  // Force shutdown if graceful shutdown takes too long
   setTimeout(() => {
     logger.error('Could not close connections in time, forcefully shutting down');
     process.exit(1);
-  }, 10000);
+  }, 10000); // 10 seconds
 };
 
+// Listen for termination signals
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT')); 
+process.on('SIGINT', () => gracefulShutdown('SIGINT')); // Catches Ctrl+C
 
+// Catch unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  logger.error('Unhandled Rejection at:', { promise, reason: reason.stack || reason });
+  // Optionally, you might want to initiate a graceful shutdown here too,
+  // depending on how critical unhandled rejections are for your application.
+  // gracefulShutdown('unhandledRejection').then(() => process.exit(1));
 });
 
+// Catch uncaught exceptions
 process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', error);
+  logger.error('Uncaught Exception:', { error: error.stack || error });
+  // For uncaught exceptions, it's generally recommended to exit after logging,
+  // as the application state might be corrupted.
   gracefulShutdown('uncaughtException').then(() => process.exit(1));
 });
 
 startServer();
 
-module.exports = app;
+module.exports = app; // For testing purposes
